@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from collections import Counter
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
@@ -199,6 +200,18 @@ def check_gallery(errors: list[str]) -> None:
     for name in sorted(types):
         if f"example-{name}.html" not in on_disk:
             errors.append(f"gallery tab {name!r} points at a missing example-{name}.html")
+    # Reject duplicate data-type declarations before building the eyebrow/
+    # order map from them. That map is a dict keyed by data-type, so two
+    # buttons declaring the same type would otherwise silently collapse into
+    # one entry — the earlier button vanishes rather than being counted, and
+    # the ordinal/duplicate-eyebrow checks below would validate whatever
+    # single entry survived instead of catching the real authoring error.
+    duplicate_types = {name: count for name, count in Counter(types).items() if count > 1}
+    for name in sorted(duplicate_types):
+        errors.append(
+            f"gallery declares data-type={name!r} on {duplicate_types[name]} "
+            "tabs; each type must have exactly one tab in assets/index.html"
+        )
     # Parse eyebrow numbers and parent-type bindings from tab buttons.
     # Variants (data-parent-type) may share their declared parent's eyebrow
     # number; uniqueness is enforced only among independent (non-variant) types.
@@ -224,6 +237,19 @@ def check_gallery(errors: list[str]) -> None:
             )
         else:
             seen_eyebrows[num] = t
+    # Enforce that independent eyebrows form one contiguous, ascending
+    # sequence matching document order. Uniqueness alone missed a tab
+    # inserted with the next available number instead of one matching its
+    # position — the tab_eyebrows dict preserves document order since it is
+    # built by a single left-to-right regex pass.
+    independent_order = [t for t in tab_eyebrows if t not in tab_parents]
+    for position, t in enumerate(independent_order, start=1):
+        if int(tab_eyebrows[t]) != position:
+            errors.append(
+                f"gallery independent tab {t!r} has eyebrow {tab_eyebrows[t]!r} "
+                f"at document position {position}; independent eyebrows must "
+                "be contiguous, ascending, and match document order"
+            )
     # Enforce that each variant's eyebrow matches its declared parent's.
     for t, parent in tab_parents.items():
         if parent not in tab_eyebrows:
