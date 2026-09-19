@@ -7,6 +7,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -103,6 +104,331 @@ def load_verify_module():
     return module
 
 
+# Every file that carries the Google Fonts css2 link or the export @import.
+# The fixtures copy them from the real tree, so the passing case is the
+# shipped wiring and each mutation below is the only defect in the tree.
+FONT_SURFACES = (
+    "assets/template.html",
+    "assets/template-dark.html",
+    "assets/template-full.html",
+    "assets/template-motion.html",
+    "references/style-guide.md",
+    "references/export.md",
+    "SKILL.md",
+)
+# Spelled out here rather than read from the verifier: a surface or template
+# dropped from the verifier's own lists must fail a test, not shrink it.
+LINK_SURFACES = (
+    "assets/template-dark.html",
+    "assets/template-full.html",
+    "assets/template-motion.html",
+    "references/style-guide.md",
+    "SKILL.md",
+)
+TEMPLATES = (
+    "assets/template.html",
+    "assets/template-dark.html",
+    "assets/template-full.html",
+    "assets/template-motion.html",
+)
+NOTO_SERIF_FAMILY = "&family=Noto+Serif:ital@0;1"
+TITLE_ORDER = "'Instrument Serif', 'Noto Serif', 'Noto Serif KR'"
+
+
+def mutate(path: Path, old: str, new: str) -> bytes:
+    """Replace *old* once in *path* and return the original bytes."""
+    original = path.read_bytes()
+    text = original.decode("utf-8")
+    if old not in text:
+        raise AssertionError(f"{path.name} no longer contains {old!r}; update the fixture")
+    path.write_bytes(text.replace(old, new, 1).encode("utf-8"))
+    return original
+
+
+@contextmanager
+def font_fixture():
+    """Yield a temp root holding the shipped font surfaces, byte for byte."""
+    with tempfile.TemporaryDirectory(prefix="verify-docs-sync-fonts-") as temp_dir:
+        root = Path(temp_dir)
+        for relative in FONT_SURFACES:
+            target = root / "skills/diagram-design" / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((ROOT / "skills/diagram-design" / relative).read_bytes())
+        yield root
+
+
+def run_checks(root: Path, *checks) -> list[str]:
+    errors: list[str] = []
+    for check in checks:
+        check(errors, root)
+    return errors
+
+
+def order_error(relative: str, face: str) -> str:
+    return (
+        f"{relative} --font-serif lists {face!r} before 'Noto Serif'; Google "
+        f"Fonts slices Cyrillic into {face} as well, so a Cyrillic title "
+        "would draw from it"
+    )
+
+
+def lacks_error(relative: str) -> str:
+    return (
+        f"{relative} --font-serif lacks 'Noto Serif'; Instrument Serif carries "
+        "no Cyrillic, so a Cyrillic title falls through to the next face"
+    )
+
+
+def link_error(relative: str) -> str:
+    return (
+        f"{relative} font link does not request Noto Serif, which its "
+        "--font-serif names for Cyrillic titles; without it they resolve "
+        "through whatever serif the viewer has installed"
+    )
+
+
+def check_font_link_parity(verify) -> None:
+    """Every css2 surface requests the template's families, each one checked."""
+    with font_fixture() as root:
+        skill = root / "skills/diagram-design"
+        errors = run_checks(root, verify.check_export_font_parity)
+        if errors:
+            raise AssertionError(f"shipped font links failed parity: {errors}")
+
+        for relative in LINK_SURFACES:
+            path = skill / relative
+            original = mutate(path, NOTO_SERIF_FAMILY, "")
+            errors = run_checks(root, verify.check_export_font_parity)
+            expected = (
+                f"{relative} font link drifts from assets/template.html: "
+                "missing Noto Serif"
+            )
+            if errors != [expected]:
+                raise AssertionError(f"{relative} dropping a family was not reported: {errors}")
+            path.write_bytes(original)
+
+        export = skill / "references/export.md"
+        original = mutate(export, "&amp;family=Noto+Serif:ital@0;1", "")
+        errors = run_checks(root, verify.check_export_font_parity)
+        expected = (
+            "references/export.md @import omits Noto Serif, which "
+            "assets/template.html requests; an exported .svg would resolve "
+            "those scripts through whatever font the viewer happens to have"
+        )
+        if errors != [expected]:
+            raise AssertionError(f"export @import drift was not reported: {errors}")
+        export.write_bytes(original)
+
+        style_guide = skill / "references/style-guide.md"
+        original = mutate(
+            style_guide, "&display=swap", "&family=Roboto:wght@400&display=swap"
+        )
+        errors = run_checks(root, verify.check_export_font_parity)
+        expected = (
+            "references/style-guide.md font link drifts from assets/template.html: "
+            "extra Roboto"
+        )
+        if errors != [expected]:
+            raise AssertionError(f"an extra style-guide family was not reported: {errors}")
+        style_guide.write_bytes(original)
+    print("OK font links: every css2 surface requests the template's families")
+
+
+def check_title_stack_order(verify) -> None:
+    """Every --font-serif in every template reaches 'Noto Serif' first."""
+    with font_fixture() as root:
+        skill = root / "skills/diagram-design"
+        errors = run_checks(root, verify.check_title_fallback_order)
+        if errors:
+            raise AssertionError(f"shipped title stacks failed the fallback order: {errors}")
+
+        # Google Fonts slices Cyrillic into Noto Serif KR too, so a stack that
+        # reaches the Korean face first draws a Cyrillic title from it.
+        for relative in TEMPLATES:
+            path = skill / relative
+            original = mutate(
+                path, TITLE_ORDER, "'Instrument Serif', 'Noto Serif KR', 'Noto Serif'"
+            )
+            errors = run_checks(root, verify.check_title_fallback_order)
+            if errors != [order_error(relative, "Noto Serif KR")]:
+                raise AssertionError(
+                    f"a CJK serif ahead of Noto Serif in {relative} was not reported: {errors}"
+                )
+            path.write_bytes(original)
+
+        # A dark-mode override is a second declaration, and the first one
+        # passing must not hide it. JP and HK carry a Cyrillic slice as well.
+        template = skill / "assets/template.html"
+        for face in ("Noto Serif JP", "Noto Serif HK"):
+            original = mutate(
+                template,
+                "</style>",
+                "@media (prefers-color-scheme: dark) {\n"
+                f"      :root {{ --font-serif: 'Instrument Serif', '{face}', "
+                "'Noto Serif', serif; }\n"
+                "    }\n"
+                "  </style>",
+            )
+            errors = run_checks(root, verify.check_title_fallback_order)
+            if errors != [order_error("assets/template.html", face)]:
+                raise AssertionError(
+                    f"a second --font-serif leading with {face} was not reported: {errors}"
+                )
+            template.write_bytes(original)
+
+        # Each distinct problem is reported once, in declaration order: an
+        # override repeated is one defect, and it does not hide a different one.
+        original = mutate(
+            template, TITLE_ORDER, "'Instrument Serif', 'Noto Serif KR', 'Noto Serif'"
+        )
+        override = (
+            "@media (prefers-color-scheme: dark) {\n"
+            "      :root { --font-serif: 'Instrument Serif', 'Noto Serif JP', "
+            "'Noto Serif', serif; }\n"
+            "    }\n"
+            "  "
+        )
+        mutate(template, "</style>", override * 2 + "</style>")
+        errors = run_checks(root, verify.check_title_fallback_order)
+        expected = [
+            order_error("assets/template.html", "Noto Serif KR"),
+            order_error("assets/template.html", "Noto Serif JP"),
+        ]
+        if errors != expected:
+            raise AssertionError(f"stack errors were not each reported once: {errors}")
+        template.write_bytes(original)
+
+        motion = skill / "assets/template-motion.html"
+        original = mutate(motion, "'Noto Serif', ", "")
+        errors = run_checks(root, verify.check_title_fallback_order)
+        if errors != [lacks_error("assets/template-motion.html")]:
+            raise AssertionError(f"a stack without Noto Serif was not reported: {errors}")
+        motion.write_bytes(original)
+    print("OK title stacks: 'Noto Serif' leads every CJK serif face")
+
+
+def check_title_font_link(verify) -> None:
+    """A stack naming Noto Serif is only as good as the link that loads it."""
+    with font_fixture() as root:
+        mutate(
+            root / "skills/diagram-design/assets/template-motion.html",
+            NOTO_SERIF_FAMILY,
+            "",
+        )
+        errors = run_checks(
+            root, verify.check_export_font_parity, verify.check_title_fallback_order
+        )
+        expected = [
+            "assets/template-motion.html font link drifts from assets/template.html: "
+            "missing Noto Serif",
+            link_error("assets/template-motion.html"),
+        ]
+        if errors != expected:
+            raise AssertionError(f"a template link without Noto Serif was not reported: {errors}")
+
+    # A failing stack must not hide the failing link beside it.
+    with font_fixture() as root:
+        motion = root / "skills/diagram-design/assets/template-motion.html"
+        mutate(motion, "'Noto Serif', ", "")
+        mutate(motion, NOTO_SERIF_FAMILY, "")
+        errors = run_checks(
+            root, verify.check_export_font_parity, verify.check_title_fallback_order
+        )
+        expected = [
+            "assets/template-motion.html font link drifts from assets/template.html: "
+            "missing Noto Serif",
+            lacks_error("assets/template-motion.html"),
+            link_error("assets/template-motion.html"),
+        ]
+        if errors != expected:
+            raise AssertionError(f"a failing stack hid the failing link beside it: {errors}")
+
+    # Dropping the family from every copy at once leaves parity nothing to
+    # disagree about; only the templates' own links can still catch it.
+    with font_fixture() as root:
+        for relative in FONT_SURFACES:
+            family = (
+                "&amp;family=Noto+Serif:ital@0;1"
+                if relative == "references/export.md"
+                else NOTO_SERIF_FAMILY
+            )
+            mutate(root / "skills/diagram-design" / relative, family, "")
+        errors = run_checks(root, verify.check_export_font_parity)
+        if errors:
+            raise AssertionError(f"a coordinated removal should pass parity: {errors}")
+        errors = run_checks(root, verify.check_title_fallback_order)
+        expected = [link_error(relative) for relative in TEMPLATES]
+        if errors != expected:
+            raise AssertionError(f"a coordinated Noto Serif removal was not reported: {errors}")
+    print("OK title links: every template loads the Noto Serif its stack names")
+
+
+def check_style_guide_anchors(verify) -> None:
+    """SKILL.md's routing links must land on a heading, not only on the file."""
+    skill = verify.SKILL.read_text(encoding="utf-8")
+    errors: list[str] = []
+    verify.check_skill_reference_links(errors, skill, verify.SKILL.parent)
+    if errors:
+        raise AssertionError(f"shipped SKILL.md reference links failed: {errors}")
+
+    # Punctuation drops out of the slug and the spaces around it survive.
+    errors = []
+    verify.check_skill_reference_links(
+        errors,
+        "See [strokes](references/style-guide.md#stroke-radius-spacing) and "
+        "[inversion](references/style-guide.md#inversion-rule-light--dark).",
+        verify.SKILL.parent,
+    )
+    if errors:
+        raise AssertionError(f"punctuated style-guide headings failed: {errors}")
+
+    errors = []
+    verify.check_skill_reference_links(
+        errors,
+        skill + "\nSee [gone](references/style-guide.md#no-such-heading).\n",
+        verify.SKILL.parent,
+    )
+    expected = (
+        "SKILL.md links to 'references/style-guide.md#no-such-heading', "
+        "which matches no heading in references/style-guide.md"
+    )
+    if errors != [expected]:
+        raise AssertionError(f"a dangling style-guide anchor was not reported: {errors}")
+    print("OK style-guide anchors: every SKILL.md link lands on a heading")
+
+
+def check_heading_syntax(verify) -> None:
+    """Closing hashes are not heading text, and fenced lines are not headings."""
+    dangling = [
+        "SKILL.md links to 'references/style-guide.md#cyrillic-labels', "
+        "which matches no heading in references/style-guide.md"
+    ]
+    cases = (
+        ("# Style Guide\n\n### Cyrillic labels ###\n", []),
+        ("```\n### Not a heading\n```\n\n### Cyrillic labels\n", []),
+        ("# Style Guide\n\n```markdown\n### Cyrillic labels\n```\n", dangling),
+        ("# Style Guide\n\n~~~\n### Cyrillic labels\n~~~\n", dangling),
+        ("# Style Guide\n\n````\n```\n### Cyrillic labels\n```\n````\n", dangling),
+        # Only the opening character closes a fence, and a backtick run with
+        # another backtick after it on the line is a code span, not a fence.
+        ("# Style Guide\n\n```\n~~~\n### Cyrillic labels\n```\n", dangling),
+        ("```x``` inline\n\n### Cyrillic labels\n", []),
+    )
+    with tempfile.TemporaryDirectory(prefix="verify-docs-sync-anchors-") as temp_dir:
+        skill = Path(temp_dir)
+        guide = skill / "references/style-guide.md"
+        guide.parent.mkdir()
+        for text, expected in cases:
+            guide.write_text(text, encoding="utf-8")
+            errors: list[str] = []
+            verify.check_skill_reference_links(
+                errors, "See [Cyrillic](references/style-guide.md#cyrillic-labels).", skill
+            )
+            if errors != expected:
+                raise AssertionError(f"heading syntax misread in {text!r}: {errors}")
+    print("OK heading syntax: closing hashes stripped, fenced lines skipped")
+
+
 def main() -> int:
     verify = load_verify_module()
 
@@ -150,6 +476,18 @@ def main() -> int:
         verify.check_manifest_descriptions(errors, root)
         if len(errors) != 1 or "lost the lexical hook" not in errors[0]:
             raise AssertionError(f"missing routing hook was not rejected: {errors}")
+
+        document = json.loads(codex.read_text(encoding="utf-8"))
+        document["description"] = short.replace("lifecycle phase", "subject progress")
+        document["interface"]["longDescription"] = document["interface"]["longDescription"].replace(
+            "lifecycle phase", "subject progress"
+        )
+        codex.write_text(json.dumps(document), encoding="utf-8")
+        errors = []
+        verify.check_manifest_descriptions(errors, root)
+        lifecycle_errors = [error for error in errors if "discovery hook 'lifecycle phase'" in error]
+        if len(lifecycle_errors) != 2:
+            raise AssertionError(f"missing lifecycle discovery hooks were not rejected: {errors}")
 
     for length in (1024, 1025):
         errors: list[str] = []
@@ -854,6 +1192,78 @@ diagram-design/
                     f"a count unrelated to the taxonomy was rejected for {benign!r}: {errors}"
                 )
 
+        # README is the same surface by another route: it carries the count in
+        # prose a user reads before installing, and it went stale there — it
+        # said 39 while the selection table shipped 40 — because nothing checked
+        # it. It points at SKILL.md §3 instead, and the two phrasings the real
+        # file used are covered so the wording cannot come back.
+        readme_routed = (
+            "# Diagram Design\n\n"
+            "Every visual type ships in three static variants; see `SKILL.md` §3.\n"
+        )
+        readme.write_text(readme_routed, encoding="utf-8")
+        errors = []
+        verify.check_type_counts(errors, root)
+        if errors:
+            raise AssertionError(f"a count-free README failed: {errors}")
+
+        for stale in (
+            "39 editorial diagram types for Claude Code.\n",
+            "All 39 visual types ship in three static variants.\n",
+            "Open the gallery to see all 39 diagrams.\n",
+            "deterministic 39-type PNG catalog renderer\n",
+            "any of the 39 visual types\n",
+        ):
+            readme.write_text(readme_routed + stale, encoding="utf-8")
+            errors = []
+            verify.check_type_counts(errors, root)
+            if (
+                len(errors) != 1
+                or "README.md" not in errors[0]
+                or "hardcodes the visual-type count" not in errors[0]
+            ):
+                raise AssertionError(
+                    f"a hardcoded README count was not reported for {stale!r}: {errors}"
+                )
+
+        # README carries ordinary numbers that are not the taxonomy count, and
+        # the two added phrasings must not start rejecting them. The last four
+        # are the shapes those phrasings would overmatch without their
+        # single-digit floor: `2-type` and `all 3 diagrams` are ordinary prose
+        # in a repository that ships 40 types, and this gate blocks a pull
+        # request, so rejecting them is worse than missing a stale count. The
+        # two-digit cases prove the guard is contextual rather than relying on
+        # a numeral-length heuristic.
+        for benign in (
+            "Renders all 3 variants from one source.\n",
+            "The gallery lists 2 file types.\n",
+            "Allows 24 nodes per diagram.\n",
+            "Runs on Python 3.11 and 3.12.\n",
+            "A 2-type system is enough here.\n",
+            "A 10-type taxonomy is enough here.\n",
+            "See all 3 diagrams in the appendix.\n",
+            "See all 12 diagrams in the appendix.\n",
+            "The 4-type taxonomy of joins.\n",
+            "All 5 diagrams are inlined.\n",
+        ):
+            readme.write_text(readme_routed + benign, encoding="utf-8")
+            errors = []
+            verify.check_type_counts(errors, root)
+            if errors:
+                raise AssertionError(
+                    f"a README count unrelated to the taxonomy was rejected for {benign!r}: "
+                    f"{errors}"
+                )
+
+        # A missing README is named rather than skipped, the way a missing
+        # command is.
+        readme.unlink()
+        errors = []
+        verify.check_type_counts(errors, root)
+        if errors != ["type-count surface is missing: README.md"]:
+            raise AssertionError(f"a missing README surface was not reported: {errors}")
+        readme.write_text(readme_routed, encoding="utf-8")
+
         # Restore the routed wording first: leaving a stale count behind lets
         # this case pass on the wrong error and never names the missing surface.
         mermaid.write_text(routed, encoding="utf-8")
@@ -982,25 +1392,85 @@ diagram-design/
         ridge_trio = ["example-ridgeline.html", "example-ridgeline-dark.html", "example-ridgeline-full.html"]
 
         # 7. Variant sharing its parent's eyebrow is allowed (no error).
-        html = make_gallery_html(make_tab("line", "20"), make_tab("ridgeline", "20", parent="line"))
+        html = make_gallery_html(make_tab("line", "01"), make_tab("ridgeline", "01", parent="line"))
         errs = run_gallery_check(html, line_trio + ridge_trio)
         if any("eyebrow" in e or "parent" in e for e in errs):
             raise AssertionError(f"valid parent/variant reuse raised error: {errs}")
         print("OK gallery: variant sharing parent eyebrow is allowed")
 
         # 8. Variant with wrong eyebrow number is caught.
-        html = make_gallery_html(make_tab("line", "20"), make_tab("ridgeline", "99", parent="line"))
+        html = make_gallery_html(make_tab("line", "01"), make_tab("ridgeline", "99", parent="line"))
         errs = run_gallery_check(html, line_trio + ridge_trio)
         if not any("ridgeline" in e and "eyebrow" in e for e in errs):
             raise AssertionError(f"variant with wrong eyebrow not caught: {errs}")
         print("OK gallery: variant with wrong eyebrow number caught")
 
         # 9. Variant declaring a missing parent is caught.
-        html = make_gallery_html(make_tab("ridgeline", "20", parent="line"))
+        html = make_gallery_html(make_tab("ridgeline", "01", parent="line"))
         errs = run_gallery_check(html, ridge_trio)
         if not any("ridgeline" in e and "line" in e for e in errs):
             raise AssertionError(f"variant with missing parent not caught: {errs}")
         print("OK gallery: variant with missing parent caught")
+
+        lifecycle_trio = [
+            "example-state-lifecycle.html",
+            "example-state-lifecycle-dark.html",
+            "example-state-lifecycle-full.html",
+        ]
+
+        # 10. Lifecycle is a complete State variant and reuses eyebrow 01.
+        html = make_gallery_html(
+            make_tab("state", "01"),
+            make_tab("state-lifecycle", "01", parent="state"),
+        )
+        errs = run_gallery_check(html, [
+            "example-state.html",
+            "example-state-dark.html",
+            "example-state-full.html",
+            *lifecycle_trio,
+        ])
+        if errs:
+            raise AssertionError(f"valid lifecycle State variant failed: {errs}")
+        print("OK gallery: lifecycle phase map is a complete State variant")
+
+        # 11. Out-of-order independent ordinals are caught (uniqueness alone is not enough).
+        html = make_gallery_html(
+            make_tab("bar", "01"),
+            make_tab("waterfall", "03"),
+            make_tab("line", "02"),
+        )
+        trio_files = (
+            ["example-bar.html", "example-bar-dark.html", "example-bar-full.html"]
+            + ["example-waterfall.html", "example-waterfall-dark.html", "example-waterfall-full.html"]
+            + line_trio
+        )
+        errs = run_gallery_check(html, trio_files)
+        if not any("contiguous ascending" in e for e in errs):
+            raise AssertionError(f"out-of-order independent ordinals not caught: {errs}")
+        print("OK gallery: out-of-order independent ordinals caught")
+
+        # 12. Gapped independent ordinals are caught (e.g. missing 02).
+        html = make_gallery_html(
+            make_tab("bar", "01"),
+            make_tab("waterfall", "02"),
+            make_tab("line", "04"),
+        )
+        errs = run_gallery_check(html, trio_files)
+        if not any("contiguous ascending" in e for e in errs):
+            raise AssertionError(f"gapped independent ordinals not caught: {errs}")
+        print("OK gallery: gapped independent ordinals caught")
+
+        # 13. Contiguous ascending independent ordinals with mid-gallery variants pass.
+        html = make_gallery_html(
+            make_tab("bar", "01"),
+            make_tab("waterfall", "02"),
+            make_tab("line", "03"),
+            make_tab("ridgeline", "03", parent="line"),
+        )
+        errs = run_gallery_check(html, trio_files + ridge_trio)
+        if any("contiguous ascending" in e or "duplicate eyebrow" in e for e in errs):
+            raise AssertionError(f"contiguous sequence with variants raised error: {errs}")
+        print("OK gallery: contiguous ascending independent ordinals pass")
 
     with tempfile.TemporaryDirectory(prefix="verify-docs-sync-assets-") as asset_tmp:
         tmp_skill_dir = Path(asset_tmp)
@@ -1028,10 +1498,18 @@ diagram-design/
             raise AssertionError(f"valid asset citations produced unexpected error: {errs}")
         print("OK reference assets: valid asset citations produce no error")
 
+    check_font_link_parity(verify)
+    check_title_stack_order(verify)
+    check_title_font_link(verify)
+    check_style_guide_anchors(verify)
+    check_heading_syntax(verify)
+
     print(
-        "PASS: docs sync checks references, asset citations, strict-bundler packaging, "
+        "PASS: docs sync checks references, style-guide anchors, asset citations, "
+        "strict-bundler packaging, "
         "routing surfaces, Factory install contract, type-count routing, High-Level invariants, "
-        "the type-ramp contract, and gallery guards (parent/variant model)"
+        "font-link parity, the Cyrillic title fallback order, the type-ramp contract, "
+        "and gallery guards (parent/variant model, contiguous ordinals)"
     )
     return 0
 
